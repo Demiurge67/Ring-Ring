@@ -1,3 +1,4 @@
 //! Local store
-pub mod db;
-pub use db::Storage;
+
+pub mod keys;
+pub use keys::{save_keys, load_keys};
