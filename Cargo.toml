@@ -1,0 +1,46 @@
+[package]
+name = "ring_ring"
+version = "0.1.0"
+edition = "2021"
+authors = ["Demiurge67 <your@email.com>"]
+license = "GPL-3.0-only"
+description = "P2P encrypted messenger core library"
+repository = "https://github.com/Demiurge67/Ring-Ring"
+
+[lib]
+name = "ring_ring"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+# P2P networking
+libp2p = { version = "0.53", features = ["tokio", "kad", "mdns", "tcp", "dns", "noise", "relay", "dcutr"] }
+tokio = { version = "1.35", features = ["full"] }
+
+# Cryptography
+x25519-dalek = "2.0"
+ed25519-dalek = "2.0"
+aes-gcm = "0.10"
+blake2 = "0.10"
+hkdf = "0.12"
+rand = "0.8"
+
+# Utilities
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.10"
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "sqlite"] }
+bytes = "1.5"
+
+# FFI (for Flutter)
+flutter_rust_bridge = "2.0"
+
+[dev-dependencies]
+tempfile = "3.8"
+tokio-test = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
