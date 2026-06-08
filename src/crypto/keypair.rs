@@ -7,8 +7,8 @@ use rand::rngs::OsRng;
 /// Возвращает (закрытый_ключ_в_hex, открытый_ключ_в_hex)
 pub fn generate_keypair() -> (String, String) {
     let mut csprng = OsRng;
-    let signing_key: SigningKey = SigningKey::generate(&mut csprng);
-    let verifying_key: VerifyingKey = signing_key.verifying_key();
+    let signing_key = SigningKey::generate(&mut csprng);
+    let verifying_key = signing_key.verifying_key();
 
     let private_hex = hex::encode(signing_key.to_bytes());
     let public_hex = hex::encode(verifying_key.to_bytes());
