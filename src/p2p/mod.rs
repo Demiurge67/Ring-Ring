@@ -1,7 +1,7 @@
-//! P2P network libp2p
+//! P2P сеть на libp2p
 
 pub mod node;
-pub mod dht;
-pub mod behaviour;
+pub mod dht;        // заглушка
+pub mod behaviour;  // заглушка
 
-// TODO: реализовать RingNode и NodeConfig
+pub use node::{RingNode, NodeConfig};
