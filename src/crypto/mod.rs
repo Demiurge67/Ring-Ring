@@ -1,8 +1,8 @@
 //! Cripto primitives
 
 pub mod keypair;
-pub mod noise;      // пока заглушка
-pub mod offline;    // пока заглушка
+pub mod noise;      // заглушка
+pub mod offline;    // заглушка
 
-// Re-export главных функций
+// Re-export main function
 pub use keypair::generate_keypair;
