@@ -1,190 +1,140 @@
-//! P2P узел с Kademlia DHT (libp2p 0.53)
+cat > src/p2p/node.rs << 'EOF'
+//! Упрощённый P2P узел на TCP + Noise (без libp2p)
 
-use libp2p::{
-    identity::Keypair,
-    swarm::{NetworkBehaviour, Swarm, SwarmEvent},
-    Multiaddr, PeerId,
-};
-use libp2p::kad::{Kademlia, KademliaEvent, store::MemoryStore, record::Key};
-use libp2p::mdns::{Mdns, MdnsEvent};
-use libp2p::ping::{Ping, PingEvent};
-use libp2p::tcp::tokio::Transport as TcpTransport;
-use libp2p::dns::tokio::Transport as DnsTransport;
-use libp2p::noise::Config as NoiseConfig;
-use libp2p::yamux::Config as YamuxConfig;
-use libp2p::core::Transport;
-use libp2p::core::upgrade::Version;
-use std::error::Error;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use noise_protocol::{Noise, Handshake, X25519, ChaChaPoly, HashBlake2b};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::task;
-use log::{info, warn};
+use std::collections::HashMap;
+use log::{info, error};
 
-/// Поведение, объединяющее Kademlia, mDNS и Ping
-#[derive(NetworkBehaviour)]
-#[behaviour(out_event = "MyBehaviourEvent")]
-pub struct MyBehaviour {
-    kademlia: Kademlia<MemoryStore>,
-    mdns: Mdns,
-    ping: Ping,
-}
+pub type PeerId = String; // временно: строка публичного ключа
 
-#[derive(Debug)]
-pub enum MyBehaviourEvent {
-    Kademlia(KademliaEvent),
-    Mdns(MdnsEvent),
-    Ping(PingEvent),
-}
-
-impl From<KademliaEvent> for MyBehaviourEvent {
-    fn from(event: KademliaEvent) -> Self {
-        MyBehaviourEvent::Kademlia(event)
-    }
-}
-
-impl From<MdnsEvent> for MyBehaviourEvent {
-    fn from(event: MdnsEvent) -> Self {
-        MyBehaviourEvent::Mdns(event)
-    }
-}
-
-impl From<PingEvent> for MyBehaviourEvent {
-    fn from(event: PingEvent) -> Self {
-        MyBehaviourEvent::Ping(event)
-    }
-}
-
-/// Настройки узла
-#[derive(Clone)]
-pub struct NodeConfig {
-    pub listen_addrs: Vec<Multiaddr>,
-    pub bootstrap_nodes: Vec<Multiaddr>,
-}
-
-impl Default for NodeConfig {
-    fn default() -> Self {
-        Self {
-            listen_addrs: vec!["/ip4/0.0.0.0/tcp/0".parse().unwrap()],
-            bootstrap_nodes: vec![],
-        }
-    }
-}
-
-/// Основная структура P2P узла
 pub struct RingNode {
-    swarm: Arc<Mutex<Swarm<MyBehaviour>>>,
-    peer_id: PeerId,
+    local_key: noise_protocol::StaticKey,
+    public_key_hex: String,
+    peers: Arc<Mutex<HashMap<PeerId, TcpStream>>>,
+    listener: Option<TcpListener>,
 }
 
 impl RingNode {
-    pub async fn new(config: NodeConfig) -> Result<Self, Box<dyn Error>> {
-        // Генерация ключей libp2p (в будущем можно заменить на наши из crypto)
-        let local_key = Keypair::generate_ed25519();
-        let peer_id = PeerId::from(local_key.public());
-
-        // Построение транспорта: DNS over TCP + Noise + Yamux
-        let transport = {
-            let tcp = TcpTransport::new(libp2p::tcp::Config::default());
-            let dns_tcp = DnsTransport::system(tcp)?;
-            let noise_config = NoiseConfig::new(&local_key)?;
-            dns_tcp
-                .upgrade(Version::V1)
-                .authenticate(noise_config)
-                .multiplex(YamuxConfig::default())
-                .boxed()
-        };
-
-        // Kademlia с хранилищем в памяти
-        let store = MemoryStore::new(peer_id);
-        let kademlia = Kademlia::new(peer_id, store);
-
-        // mDNS для локального обнаружения
-        let mdns = Mdns::new()?;
-
-        let ping = Ping::default();
-
-        let behaviour = MyBehaviour { kademlia, mdns, ping };
-
-        let mut swarm = Swarm::new(transport, behaviour, peer_id);
-
-        for addr in config.listen_addrs {
-            swarm.listen_on(addr)?;
-        }
-
-        // Подключение к bootstrap нодам
-        for addr in config.bootstrap_nodes {
-            if let Some(peer_id) = extract_peer_id(&addr) {
-                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                // Инициируем bootstrap (поиск других узлов)
-                let _ = swarm.behaviour_mut().kademlia.bootstrap();
-            } else {
-                warn!("Bootstrap address without peer_id: {}", addr);
-            }
-        }
-
-        let swarm = Arc::new(Mutex::new(swarm));
-        let swarm_clone = swarm.clone();
-
-        // Запуск обработки событий в отдельной задаче
-        task::spawn(async move {
-            let mut swarm = swarm_clone.lock().await;
-            loop {
-                match swarm.select_next_some().await {
-                    SwarmEvent::Behaviour(MyBehaviourEvent::Kademlia(event)) => {
-                        info!("Kademlia event: {:?}", event);
-                    }
-                    SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(MdnsEvent::Discovered(list))) => {
-                        for (peer, addr) in list {
-                            info!("mDNS discovered: {} at {}", peer, addr);
-                            swarm.behaviour_mut().kademlia.add_address(&peer, addr);
-                        }
-                    }
-                    SwarmEvent::Behaviour(MyBehaviourEvent::Ping(_)) => {}
-                    SwarmEvent::NewListenAddr { address, .. } => {
-                        info!("Listening on {}", address);
-                    }
-                    _ => {}
-                }
-            }
-        });
-
-        Ok(Self { swarm, peer_id })
+    /// Создаёт новый узел, генерирует ключи Noise (X25519)
+    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let local_key = noise_protocol::StaticKey::new();
+        let public_key_hex = hex::encode(local_key.public_key());
+        Ok(Self {
+            local_key,
+            public_key_hex,
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            listener: None,
+        })
     }
 
-    /// Публикует запись в DHT: ключ = произвольная строка (например, hex публичного ключа пользователя),
-    /// значение = мультиадрес узла (в виде строки)
-    pub async fn publish_address(&self, key_str: &str, address: Multiaddr) -> Result<(), Box<dyn Error>> {
-        let key = Key::new(key_str.as_bytes().to_vec());
-        let value = address.to_string().into_bytes();
-        // В libp2p 0.53 запись не требует подписи для памяти, просто кладём в DHT
-        self.swarm.lock().await.behaviour_mut().kademlia.put_record(key, value, libp2p::kad::Quorum::One)?;
-        info!("Published address for key {}", key_str);
+    /// Запускает прослушивание входящих соединений на указанном адресе (например, "0.0.0.0:12345")
+    pub async fn listen(&mut self, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(addr).await?;
+        self.listener = Some(listener);
+        let peers = self.peers.clone();
+        let local_key = self.local_key.clone();
+        tokio::spawn(async move {
+            let mut listener = listener;
+            while let Ok((stream, _)) = listener.accept().await {
+                // Запускаем обработку входящего соединения
+                tokio::spawn(handle_incoming(stream, peers.clone(), local_key.clone()));
+            }
+        });
         Ok(())
     }
 
-    // Для поиска адреса по ключу нужна асинхронная логика с каналами. Пока заглушка.
-    // В следующем шаге реализуем полноценный lookup.
-
-    pub fn peer_id(&self) -> PeerId {
-        self.peer_id
+    /// Устанавливает соединение с удалённым узлом по адресу (ip:port) и выполняет Noise handshake.
+    /// Возвращает PeerId (публичный ключ собеседника) и зашифрованный поток.
+    pub async fn connect(&self, addr: &str) -> Result<(PeerId, TcpStream), Box<dyn std::error::Error>> {
+        let stream = TcpStream::connect(addr).await?;
+        let (peer_pubkey, encrypted_stream) = noise_client_handshake(stream, &self.local_key).await?;
+        Ok((peer_pubkey, encrypted_stream))
     }
 
-    pub async fn listen_addrs(&self) -> Vec<Multiaddr> {
-        self.swarm.lock().await.listeners().cloned().collect()
+    /// Отправляет сообщение через уже установленный зашифрованный канал.
+    pub async fn send(stream: &mut TcpStream, msg: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        let len = msg.len() as u32;
+        stream.write_all(&len.to_le_bytes()).await?;
+        stream.write_all(msg).await?;
+        Ok(())
     }
 
-    pub async fn stop(&self) {
-        info!("Stopping RingNode");
+    /// Получает сообщение из зашифрованного канала.
+    pub async fn recv(stream: &mut TcpStream) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).await?;
+        Ok(buf)
+    }
+
+    pub fn public_key_hex(&self) -> &str {
+        &self.public_key_hex
     }
 }
 
-/// Извлечь PeerId из мультиадреса (если присутствует компонент /p2p/...)
-fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
-    let mut iter = addr.iter();
-    while let Some(protocol) = iter.next() {
-        if let libp2p::core::multiaddr::Protocol::P2p(hash) = protocol {
-            return Some(PeerId::from_multihash(hash).ok()?);
+/// Обработка входящего соединения: выполняем Noise handshake как сервер.
+async fn handle_incoming(
+    stream: TcpStream,
+    peers: Arc<Mutex<HashMap<PeerId, TcpStream>>>,
+    local_key: noise_protocol::StaticKey,
+) {
+    match noise_server_handshake(stream, local_key).await {
+        Ok((peer_pubkey, encrypted_stream)) => {
+            info!("Handshake successful with peer: {}", hex::encode(&peer_pubkey));
+            peers.lock().await.insert(hex::encode(peer_pubkey), encrypted_stream);
         }
+        Err(e) => error!("Handshake failed: {}", e),
     }
-    None
 }
+
+/// Шум-хендшейк со стороны клиента (инициатор)
+async fn noise_client_handshake(
+    mut stream: TcpStream,
+    static_key: &noise_protocol::StaticKey,
+) -> Result<(Vec<u8>, TcpStream), Box<dyn std::error::Error>> {
+    let mut noise = Noise::new(static_key.clone());
+    let mut handshake = Handshake::new(noise, b"Noise_XX_25519_ChaChaPoly_BLAKE2b")?;
+    handshake.start_initiator()?;
+    // Обмен сообщениями (упрощённо: три пакета)
+    let mut buf = [0u8; 1024];
+    let len = handshake.write_message(&mut buf)?;
+    stream.write_all(&buf[..len]).await?;
+    let n = stream.read(&mut buf).await?;
+    handshake.read_message(&buf[..n])?;
+    let len = handshake.write_message(&mut buf)?;
+    stream.write_all(&buf[..len]).await?;
+    let n = stream.read(&mut buf).await?;
+    handshake.read_message(&buf[..n])?;
+    let peer_pubkey = handshake.get_remote_static()?;
+    let encrypted_stream = stream;
+    Ok((peer_pubkey.to_vec(), encrypted_stream))
+}
+
+/// Шум-хендшейк со стороны сервера (ответчик)
+async fn noise_server_handshake(
+    mut stream: TcpStream,
+    static_key: noise_protocol::StaticKey,
+) -> Result<(Vec<u8>, TcpStream), Box<dyn std::error::Error>> {
+    let mut noise = Noise::new(static_key);
+    let mut handshake = Handshake::new(noise, b"Noise_XX_25519_ChaChaPoly_BLAKE2b")?;
+    handshake.start_responder()?;
+    let mut buf = [0u8; 1024];
+    let n = stream.read(&mut buf).await?;
+    handshake.read_message(&buf[..n])?;
+    let len = handshake.write_message(&mut buf)?;
+    stream.write_all(&buf[..len]).await?;
+    let n = stream.read(&mut buf).await?;
+    handshake.read_message(&buf[..n])?;
+    let len = handshake.write_message(&mut buf)?;
+    stream.write_all(&buf[..len]).await?;
+    let peer_pubkey = handshake.get_remote_static()?;
+    let encrypted_stream = stream;
+    Ok((peer_pubkey.to_vec(), encrypted_stream))
+}
+EOF
