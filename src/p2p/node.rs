@@ -1,157 +1,120 @@
-//! P2P узел с Kademlia DHT (libp2p 0.53)
+//! P2P узел на основе libp2p (адаптировано из примера chat)
+//! Источник: https://raw.githubusercontent.com/libp2p/rust-libp2p/refs/heads/master/examples/chat/src/main.rs
 
 use libp2p::{
-    core::{transport::Transport, upgrade::Version},
-    identity::Keypair,
+    gossipsub,
+    mdns,
     noise,
-    swarm::{NetworkBehaviour, Swarm, SwarmEvent},
+    swarm::SwarmBuilder,
     tcp,
     yamux,
     Multiaddr, PeerId,
+    identity,
+    swarm::{NetworkBehaviour, SwarmEvent},
 };
-use libp2p::kad::{self, store::MemoryStore, Kademlia, KademliaEvent, record::Key};
-use libp2p::mdns::{Mdns, MdnsEvent};
-use libp2p::ping::{Ping, PingEvent};
 use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::task;
-use log::{info, warn};
+use futures::StreamExt;
+use log::{info, error};
 
-/// Поведение, объединяющее Kademlia, mDNS и Ping
+/// Поведение узла: gossipsub (чат) + mDNS (обнаружение)
 #[derive(NetworkBehaviour)]
-#[behaviour(out_event = "MyBehaviourEvent")]
 pub struct MyBehaviour {
-    kademlia: Kademlia<MemoryStore>,
-    mdns: Mdns,
-    ping: Ping,
+    pub gossipsub: gossipsub::Behaviour,
+    pub mdns: mdns::tokio::Behaviour,
 }
 
-/// Тип событий, порождаемых поведением
-#[derive(Debug)]
-pub enum MyBehaviourEvent {
-    Kademlia(KademliaEvent),
-    Mdns(MdnsEvent),
-    Ping(PingEvent),
-}
-
-impl From<KademliaEvent> for MyBehaviourEvent {
-    fn from(event: KademliaEvent) -> Self {
-        MyBehaviourEvent::Kademlia(event)
-    }
-}
-
-impl From<MdnsEvent> for MyBehaviourEvent {
-    fn from(event: MdnsEvent) -> Self {
-        MyBehaviourEvent::Mdns(event)
-    }
-}
-
-impl From<PingEvent> for MyBehaviourEvent {
-    fn from(event: PingEvent) -> Self {
-        MyBehaviourEvent::Ping(event)
-    }
-}
-
-/// Настройки узла
-#[derive(Clone)]
+/// Конфигурация узла
 pub struct NodeConfig {
     pub listen_addrs: Vec<Multiaddr>,
-    pub bootstrap_nodes: Vec<Multiaddr>,
 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             listen_addrs: vec!["/ip4/0.0.0.0/tcp/0".parse().unwrap()],
-            bootstrap_nodes: vec![],
         }
     }
 }
 
 /// Основная структура P2P узла
 pub struct RingNode {
-    swarm: Arc<Mutex<Swarm<MyBehaviour>>>,
-    peer_id: PeerId,
+    pub swarm: Arc<Mutex<libp2p::Swarm<MyBehaviour>>>,
+    pub peer_id: PeerId,
 }
 
 impl RingNode {
     pub async fn new(config: NodeConfig) -> Result<Self, Box<dyn Error>> {
-        // Генерация ключей libp2p
-        let local_key = Keypair::generate_ed25519();
+        // Генерируем ключи (в будущем заменим на наши из crypto)
+        let local_key = identity::Keypair::generate_ed25519();
         let peer_id = PeerId::from(local_key.public());
 
-        // Транспорт: TCP/DNS + Noise + Yamux
+        // Транспорт: TCP, Noise, Yamux
         let transport = tcp::tokio::Transport::new(tcp::Config::default())
-            .map(|(peer, conn), _| (peer, conn))
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
-            .boxed();
-
-        // Временный вариант: используем только TCP без DNS для упрощения
-        let transport = libp2p::dns::tokio::Transport::system(transport)?;
-        let noise_keys = noise::Keypair::<noise::X25519Spec>::new()
-            .into_authentic(&local_key)?;
-        let transport = transport
-            .upgrade(Version::V1)
-            .authenticate(noise::Config::new(noise_keys))
+            .upgrade(libp2p::core::upgrade::Version::V1)
+            .authenticate(noise::Config::new(&local_key)?)
             .multiplex(yamux::Config::default())
-            .timeout(std::time::Duration::from_secs(20))
             .boxed();
 
-        // Kademlia с хранилищем в памяти
-        let store = MemoryStore::new(peer_id);
-        let kademlia = Kademlia::new(peer_id, store);
+        // Настройка gossipsub
+        let gossipsub_config = gossipsub::ConfigBuilder::default()
+            .heartbeat_interval(std::time::Duration::from_secs(10))
+            .validation_mode(gossipsub::ValidationMode::Strict)
+            .build()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        // mDNS
-        let mdns = Mdns::new()?;
+        let gossipsub = gossipsub::Behaviour::new(
+            gossipsub::MessageAuthenticity::Signed(local_key.clone()),
+            gossipsub_config,
+        )?;
 
-        // Ping
-        let ping = Ping::default();
+        // mDNS для локального обнаружения
+        let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
 
-        let behaviour = MyBehaviour { kademlia, mdns, ping };
+        let behaviour = MyBehaviour { gossipsub, mdns };
+        let mut swarm = SwarmBuilder::with_tokio_executor(transport, behaviour, peer_id).build();
 
-        // Создаём Swarm с конфигурацией по умолчанию
-        let mut swarm = Swarm::new(transport, behaviour, peer_id);
-
+        // Запускаем прослушивание адресов
         for addr in config.listen_addrs {
             swarm.listen_on(addr)?;
         }
 
-        // Подключение к bootstrap нодам
-        for addr in config.bootstrap_nodes {
-            if let Some(peer_id) = extract_peer_id(&addr) {
-                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                let _ = swarm.behaviour_mut().kademlia.bootstrap();
-            } else {
-                warn!("Bootstrap address without peer_id: {}", addr);
-            }
-        }
+        // Подписываемся на топик (например, "ring-ring-chat")
+        let topic = gossipsub::IdentTopic::new("ring-ring-chat");
+        swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
         let swarm = Arc::new(Mutex::new(swarm));
         let swarm_clone = swarm.clone();
 
-        // Запуск обработки событий в отдельной задаче
-        task::spawn(async move {
+        // Запускаем обработку событий
+        tokio::spawn(async move {
             let mut swarm = swarm_clone.lock().await;
             loop {
                 match swarm.select_next_some().await {
-                    SwarmEvent::Behaviour(MyBehaviourEvent::Kademlia(event)) => {
-                        info!("Kademlia event: {:?}", event);
-                    }
-                    SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(MdnsEvent::Discovered(list))) => {
-                        for (peer, addr) in list {
-                            info!("mDNS discovered: {} at {}", peer, addr);
-                            swarm.behaviour_mut().kademlia.add_address(&peer, addr);
-                        }
-                    }
-                    SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(MdnsEvent::Expired(list))) => {
-                        for (peer, _) in list {
-                            info!("mDNS expired: {}", peer);
-                        }
-                    }
-                    SwarmEvent::Behaviour(MyBehaviourEvent::Ping(_)) => {}
                     SwarmEvent::NewListenAddr { address, .. } => {
                         info!("Listening on {}", address);
+                    }
+                    SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+                        for (peer, addr) in peers {
+                            info!("mDNS discovered: {} at {}", peer, addr);
+                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
+                        }
+                    }
+                    SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
+                        for (peer, _) in peers {
+                            info!("mDNS expired: {}", peer);
+                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer);
+                        }
+                    }
+                    SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                        propagation_source: _,
+                        message_id: _,
+                        message,
+                    })) => {
+                        let msg = String::from_utf8_lossy(&message.data);
+                        info!("Received: {}", msg);
+                        // TODO: расшифровать сообщение и сохранить в хранилище
                     }
                     _ => {}
                 }
@@ -161,42 +124,31 @@ impl RingNode {
         Ok(Self { swarm, peer_id })
     }
 
-    /// Публикует запись в DHT: ключ = произвольная строка (например, hex публичного ключа пользователя),
-    /// значение = мультиадрес узла (в виде строки)
-    pub async fn publish_address(&self, key_str: &str, address: Multiaddr) -> Result<(), Box<dyn Error>> {
-        let key = Key::new(key_str.as_bytes().to_vec());
-        let value = address.to_string().into_bytes();
-        self.swarm.lock().await.behaviour_mut().kademlia.put_record(key, value, kad::Quorum::One)?;
-        info!("Published address for key {}", key_str);
+    /// Отправить сообщение в топик всем подписчикам
+    pub async fn broadcast(&self, message: String) -> Result<(), Box<dyn Error>> {
+        let topic = gossipsub::IdentTopic::new("ring-ring-chat");
+        let data = message.as_bytes().to_vec();
+        let mut swarm = self.swarm.lock().await;
+        swarm.behaviour_mut().gossipsub.publish(topic, data)?;
         Ok(())
-    }
-
-    // Поиск адреса по ключу (заглушка, будет реализован позже)
-    pub async fn lookup_address(&self, _key_str: &str) -> Option<Multiaddr> {
-        // TODO: реализовать через каналы
-        None
-    }
-
-    pub fn peer_id(&self) -> PeerId {
-        self.peer_id
-    }
-
-    pub async fn listen_addrs(&self) -> Vec<Multiaddr> {
-        self.swarm.lock().await.listeners().cloned().collect()
-    }
-
-    pub async fn stop(&self) {
-        info!("Stopping RingNode");
     }
 }
 
-/// Извлечь PeerId из мультиадреса (если присутствует компонент /p2p/...)
-fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
-    let mut iter = addr.iter();
-    while let Some(protocol) = iter.next() {
-        if let libp2p::core::multiaddr::Protocol::P2p(hash) = protocol {
-            return Some(PeerId::from_multihash(hash).ok()?);
-        }
+// Тип событий для поведения
+#[derive(Debug)]
+pub enum MyBehaviourEvent {
+    Gossipsub(gossipsub::Event),
+    Mdns(mdns::Event),
+}
+
+impl From<gossipsub::Event> for MyBehaviourEvent {
+    fn from(event: gossipsub::Event) -> Self {
+        MyBehaviourEvent::Gossipsub(event)
     }
-    None
+}
+
+impl From<mdns::Event> for MyBehaviourEvent {
+    fn from(event: mdns::Event) -> Self {
+        MyBehaviourEvent::Mdns(event)
+    }
 }
