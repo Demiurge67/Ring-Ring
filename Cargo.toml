@@ -12,7 +12,7 @@ name = "ring_ring"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-libp2p = { version = "0.53", features = ["tokio", "tcp", "dns", "noise", "yamux", "kad", "mdns", "ping"] }
+libp2p = { version = "0.53", features = ["tokio", "tcp", "dns", "noise", "yamux", "kad", "mdns", "ping", "gossipsub"] }
 tokio = { version = "1.35", features = ["full"] }
 log = "0.4"
 env_logger = "0.10"
