@@ -23,11 +23,8 @@ mod tests {
     #[test]
     fn test_generate_keypair() {
         let (priv_hex, pub_hex) = generate_keypair();
-        // Длина закрытого ключа Ed25519: 32 байта -> 64 hex-символа
         assert_eq!(priv_hex.len(), 64);
-        // Длина открытого ключа: 32 байта -> 64 hex
         assert_eq!(pub_hex.len(), 64);
-        // Они не должны быть одинаковыми
         assert_ne!(priv_hex, pub_hex);
     }
 }
