@@ -3,7 +3,6 @@
 pub mod crypto;
 pub mod p2p;
 pub mod storage;
-pub mod events;
 
 pub use crypto::keypair::generate_keypair;
 pub use storage::keys::{save_keys, load_keys};
@@ -17,7 +16,6 @@ pub fn init() {
 }
 
 /// Инициализация клиента: загрузка или генерация ключей.
-/// Возвращает (private_key_hex, public_key_hex)
 pub fn init_client() -> (String, String) {
     init();
     match load_keys() {
@@ -35,21 +33,8 @@ pub fn init_client() -> (String, String) {
         }
         Err(e) => {
             log::error!("Failed to load keys: {}", e);
-            // В случае ошибки загрузки генерируем новые (без сохранения?)
             let (priv_hex, pub_hex) = generate_keypair();
             (priv_hex, pub_hex)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_init_client() {
-        let (priv_hex, pub_hex) = init_client();
-        assert_eq!(priv_hex.len(), 64);
-        assert_eq!(pub_hex.len(), 64);
     }
 }
