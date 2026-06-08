@@ -16,6 +16,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 libp2p = { version = "0.53", features = ["tokio", "kad", "mdns", "tcp", "dns", "noise", "relay", "dcutr", "yamux", "ping"] }
 tokio = { version = "1.35", features = ["full"] }
 hex = "0.4"
+noise-protocol = "0.2"
 
 # Cryptography
 x25519-dalek = "2.0"
