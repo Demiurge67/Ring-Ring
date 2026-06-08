@@ -1,4 +1,3 @@
-cat > src/p2p/node.rs << 'EOF'
 //! Упрощённый P2P узел на TCP + Noise (без libp2p)
 
 use tokio::net::{TcpListener, TcpStream};
@@ -137,4 +136,3 @@ async fn noise_server_handshake(
     let encrypted_stream = stream;
     Ok((peer_pubkey.to_vec(), encrypted_stream))
 }
-EOF
