@@ -5,27 +5,24 @@ use libp2p::{
     gossipsub,
     mdns,
     noise,
-    swarm::SwarmBuilder,
+    swarm::{SwarmBuilder, SwarmEvent, NetworkBehaviour},
     tcp,
     yamux,
-    Multiaddr, PeerId,
-    identity,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    Multiaddr, PeerId, identity,
+    core::transport::Transport,
+    futures::StreamExt,
 };
 use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use futures::StreamExt;
-use log::{info, error};
+use log::{info, warn};
 
-/// Поведение узла: gossipsub (чат) + mDNS (обнаружение)
 #[derive(NetworkBehaviour)]
 pub struct MyBehaviour {
-    pub gossipsub: gossipsub::Behaviour,
-    pub mdns: mdns::tokio::Behaviour,
+    gossipsub: gossipsub::Behaviour,
+    mdns: mdns::tokio::Behaviour,
 }
 
-/// Конфигурация узла
 pub struct NodeConfig {
     pub listen_addrs: Vec<Multiaddr>,
 }
@@ -38,7 +35,6 @@ impl Default for NodeConfig {
     }
 }
 
-/// Основная структура P2P узла
 pub struct RingNode {
     pub swarm: Arc<Mutex<libp2p::Swarm<MyBehaviour>>>,
     pub peer_id: PeerId,
@@ -46,18 +42,15 @@ pub struct RingNode {
 
 impl RingNode {
     pub async fn new(config: NodeConfig) -> Result<Self, Box<dyn Error>> {
-        // Генерируем ключи (в будущем заменим на наши из crypto)
         let local_key = identity::Keypair::generate_ed25519();
         let peer_id = PeerId::from(local_key.public());
 
-        // Транспорт: TCP, Noise, Yamux
         let transport = tcp::tokio::Transport::new(tcp::Config::default())
             .upgrade(libp2p::core::upgrade::Version::V1)
             .authenticate(noise::Config::new(&local_key)?)
             .multiplex(yamux::Config::default())
             .boxed();
 
-        // Настройка gossipsub
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(std::time::Duration::from_secs(10))
             .validation_mode(gossipsub::ValidationMode::Strict)
@@ -69,25 +62,21 @@ impl RingNode {
             gossipsub_config,
         )?;
 
-        // mDNS для локального обнаружения
         let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
 
         let behaviour = MyBehaviour { gossipsub, mdns };
         let mut swarm = SwarmBuilder::with_tokio_executor(transport, behaviour, peer_id).build();
 
-        // Запускаем прослушивание адресов
         for addr in config.listen_addrs {
             swarm.listen_on(addr)?;
         }
 
-        // Подписываемся на топик (например, "ring-ring-chat")
         let topic = gossipsub::IdentTopic::new("ring-ring-chat");
         swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
         let swarm = Arc::new(Mutex::new(swarm));
         let swarm_clone = swarm.clone();
 
-        // Запускаем обработку событий
         tokio::spawn(async move {
             let mut swarm = swarm_clone.lock().await;
             loop {
@@ -114,7 +103,6 @@ impl RingNode {
                     })) => {
                         let msg = String::from_utf8_lossy(&message.data);
                         info!("Received: {}", msg);
-                        // TODO: расшифровать сообщение и сохранить в хранилище
                     }
                     _ => {}
                 }
@@ -124,7 +112,6 @@ impl RingNode {
         Ok(Self { swarm, peer_id })
     }
 
-    /// Отправить сообщение в топик всем подписчикам
     pub async fn broadcast(&self, message: String) -> Result<(), Box<dyn Error>> {
         let topic = gossipsub::IdentTopic::new("ring-ring-chat");
         let data = message.as_bytes().to_vec();
@@ -134,7 +121,6 @@ impl RingNode {
     }
 }
 
-// Тип событий для поведения
 #[derive(Debug)]
 pub enum MyBehaviourEvent {
     Gossipsub(gossipsub::Event),
