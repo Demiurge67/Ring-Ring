@@ -12,7 +12,8 @@ name = "ring_ring"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-libp2p = { version = "0.53", features = ["tcp", "tokio", "noise", "yamux", "gossipsub", "mdns", "swarm-derive"] }
+libp2p = { version = "0.53", features = ["tcp", "tokio", "noise", "yamux", "gossipsub", "mdns"] }
+libp2p-swarm-derive = "0.2"
 tokio = { version = "1.35", features = ["full"] }
 futures = "0.3"
 log = "0.4"
