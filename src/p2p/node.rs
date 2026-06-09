@@ -9,6 +9,7 @@ use libp2p::{
     core::upgrade::Version,
     futures::StreamExt,
 };
+use libp2p_swarm_derive::NetworkBehaviour; 
 use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::Mutex;
