@@ -2,7 +2,7 @@
 name = "ring_ring"
 version = "0.1.0"
 edition = "2021"
-authors = ["Demiurge67 <your@email.com>"]
+authors = ["Demiurge67"]
 license = "GPL-3.0-only"
 description = "P2P encrypted messenger core library"
 repository = "https://github.com/Demiurge67/Ring-Ring"
@@ -20,32 +20,21 @@ quinn = "0.11"
 rustls = "0.23"
 rcgen = "0.12"
 
-# mDNS discovery
-mdns-sd = "0.10"
-
-# Cryptography
-x25519-dalek = "2.0"
+# Crypto & keys
 ed25519-dalek = "2.0"
-chacha20poly1305 = "0.10"
-blake2 = "0.10"
-hkdf = "0.12"
 rand = "0.8"
 hex = "0.4"
 
-# Utilities
-anyhow = "1.0"
-thiserror = "1.0"
+# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-dirs = "5.0"
-sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "sqlite"] }
-bytes = "1.5"
+
+# Utilities
+anyhow = "1.0"
 log = "0.4"
 env_logger = "0.10"
+dirs = "5.0"
 futures = "0.3"
-
-# FFI (for Flutter)
-flutter_rust_bridge = "2.0"
 
 [dev-dependencies]
 tempfile = "3.8"
