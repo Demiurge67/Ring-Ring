@@ -12,12 +12,16 @@ name = "ring_ring"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-libp2p = { version = "0.53", features = ["tcp", "tokio", "noise", "yamux", "gossipsub", "mdns"] }
-libp2p-swarm-derive = "0.35.1"
+# Async runtime
 tokio = { version = "1.35", features = ["full"] }
-futures = "0.3"
-log = "0.4"
-env_logger = "0.10"
+
+# QUIC transport
+quinn = "0.11"
+rustls = "0.23"
+rcgen = "0.12"
+
+# mDNS discovery
+mdns-sd = "0.10"
 
 # Cryptography
 x25519-dalek = "2.0"
@@ -26,6 +30,7 @@ chacha20poly1305 = "0.10"
 blake2 = "0.10"
 hkdf = "0.12"
 rand = "0.8"
+hex = "0.4"
 
 # Utilities
 anyhow = "1.0"
@@ -35,6 +40,9 @@ serde_json = "1.0"
 dirs = "5.0"
 sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "sqlite"] }
 bytes = "1.5"
+log = "0.4"
+env_logger = "0.10"
+futures = "0.3"
 
 # FFI (for Flutter)
 flutter_rust_bridge = "2.0"
