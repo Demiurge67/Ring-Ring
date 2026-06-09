@@ -2,14 +2,11 @@
 //! Источник: https://raw.githubusercontent.com/libp2p/rust-libp2p/refs/heads/master/examples/chat/src/main.rs
 
 use libp2p::{
-    gossipsub,
-    mdns,
-    noise,
-    swarm::{SwarmBuilder, SwarmEvent, NetworkBehaviour},
-    tcp,
-    yamux,
-    Multiaddr, PeerId, identity,
-    core::transport::Transport,
+    gossipsub, mdns, noise, tcp, yamux,
+    identity,
+    Multiaddr, PeerId,
+    swarm::{NetworkBehaviour, Swarm, SwarmEvent},
+    core::upgrade::Version,
     futures::StreamExt,
 };
 use std::error::Error;
@@ -17,12 +14,34 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use log::{info, warn};
 
+/// Поведение узла
 #[derive(NetworkBehaviour)]
+#[behaviour(to_swarm = "MyBehaviourEvent")]
 pub struct MyBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
 }
 
+/// События поведения
+#[derive(Debug)]
+pub enum MyBehaviourEvent {
+    Gossipsub(gossipsub::Event),
+    Mdns(mdns::Event),
+}
+
+impl From<gossipsub::Event> for MyBehaviourEvent {
+    fn from(event: gossipsub::Event) -> Self {
+        MyBehaviourEvent::Gossipsub(event)
+    }
+}
+
+impl From<mdns::Event> for MyBehaviourEvent {
+    fn from(event: mdns::Event) -> Self {
+        MyBehaviourEvent::Mdns(event)
+    }
+}
+
+/// Конфигурация узла
 pub struct NodeConfig {
     pub listen_addrs: Vec<Multiaddr>,
 }
@@ -35,8 +54,9 @@ impl Default for NodeConfig {
     }
 }
 
+/// Основная структура узла
 pub struct RingNode {
-    pub swarm: Arc<Mutex<libp2p::Swarm<MyBehaviour>>>,
+    pub swarm: Arc<Mutex<Swarm<MyBehaviour>>>,
     pub peer_id: PeerId,
 }
 
@@ -45,9 +65,10 @@ impl RingNode {
         let local_key = identity::Keypair::generate_ed25519();
         let peer_id = PeerId::from(local_key.public());
 
+        let noise_keys = noise::Config::new(&local_key)?;
         let transport = tcp::tokio::Transport::new(tcp::Config::default())
-            .upgrade(libp2p::core::upgrade::Version::V1)
-            .authenticate(noise::Config::new(&local_key)?)
+            .upgrade(Version::V1)
+            .authenticate(noise_keys)
             .multiplex(yamux::Config::default())
             .boxed();
 
@@ -65,7 +86,8 @@ impl RingNode {
         let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
 
         let behaviour = MyBehaviour { gossipsub, mdns };
-        let mut swarm = SwarmBuilder::with_tokio_executor(transport, behaviour, peer_id).build();
+
+        let mut swarm = Swarm::new(transport, behaviour, peer_id);
 
         for addr in config.listen_addrs {
             swarm.listen_on(addr)?;
@@ -97,9 +119,7 @@ impl RingNode {
                         }
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                        propagation_source: _,
-                        message_id: _,
-                        message,
+                        message, ..
                     })) => {
                         let msg = String::from_utf8_lossy(&message.data);
                         info!("Received: {}", msg);
@@ -118,23 +138,5 @@ impl RingNode {
         let mut swarm = self.swarm.lock().await;
         swarm.behaviour_mut().gossipsub.publish(topic, data)?;
         Ok(())
-    }
-}
-
-#[derive(Debug)]
-pub enum MyBehaviourEvent {
-    Gossipsub(gossipsub::Event),
-    Mdns(mdns::Event),
-}
-
-impl From<gossipsub::Event> for MyBehaviourEvent {
-    fn from(event: gossipsub::Event) -> Self {
-        MyBehaviourEvent::Gossipsub(event)
-    }
-}
-
-impl From<mdns::Event> for MyBehaviourEvent {
-    fn from(event: mdns::Event) -> Self {
-        MyBehaviourEvent::Mdns(event)
     }
 }
