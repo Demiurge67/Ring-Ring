@@ -1,6 +1,6 @@
 //! Генерация и работа с ключевой парой Ed25519
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
 
