@@ -1,89 +1,174 @@
-// examples/simple_chat.rs
-// Запуск: cargo run --example simple_chat server
-//         cargo run --example simple_chat client
-use snow::{Builder, Keypair};
-use std::io::{Read, Write};
+//! P2P транспорт на TCP + Noise (XX handshake) – блокирующий ввод-вывод в отдельном потоке
+
+use snow::{Builder, Keypair, TransportState};
 use std::net::{TcpListener, TcpStream};
-use rand::Rng;
-use std::thread;
+use std::io::{Read, Write};
+use anyhow::{Result, Context};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use rand::RngCore;
 
-const PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
-fn main() {
-    let args: Vec<_> = std::env::args().collect();
-    let is_server = args.len() > 1 && args[1] == "server";
+/// Генерирует статическую ключевую пару для узла (один раз при запуске)
+pub fn generate_static_keypair() -> Keypair {
     let mut rng = rand::thread_rng();
-    let mut priv_bytes = [0u8; 32];
-    rng.fill_bytes(&mut priv_bytes);
-    let static_key = Keypair::from_private(&priv_bytes).unwrap();
-
-    if is_server {
-        let listener = TcpListener::bind("0.0.0.0:12345").unwrap();
-        println!("Server listening");
-        for stream in listener.incoming() {
-            let stream = stream.unwrap();
-            let key = static_key.clone();
-            thread::spawn(move || handle(stream, key, true));
-        }
-    } else {
-        let stream = TcpStream::connect("127.0.0.1:12345").unwrap();
-        handle(stream, static_key, false);
-    }
+    Keypair::generate(&mut rng)
 }
 
-fn handle(mut stream: TcpStream, key: Keypair, responder: bool) {
-    let mut noise = if responder {
-        Builder::new(PATTERN.parse().unwrap())
-            .local_private_key(&key.private)
-            .build_responder()
-            .unwrap()
-    } else {
-        Builder::new(PATTERN.parse().unwrap())
-            .local_private_key(&key.private)
-            .build_initiator()
-            .unwrap()
-    };
-    let mut buf = [0u8; 65535];
-    // Handshake
-    if !responder {
-        let len = noise.write_message(&[], &mut buf).unwrap();
-        stream.write_all(&buf[..len]).unwrap();
-        let n = stream.read(&mut buf).unwrap();
-        noise.read_message(&buf[..n], &mut buf).unwrap();
-        let len = noise.write_message(&[], &mut buf).unwrap();
-        stream.write_all(&buf[..len]).unwrap();
-        let n = stream.read(&mut buf).unwrap();
-        noise.read_message(&buf[..n], &mut buf).unwrap();
-    } else {
-        let n = stream.read(&mut buf).unwrap();
-        noise.read_message(&buf[..n], &mut buf).unwrap();
-        let len = noise.write_message(&[], &mut buf).unwrap();
-        stream.write_all(&buf[..len]).unwrap();
-        let n = stream.read(&mut buf).unwrap();
-        noise.read_message(&buf[..n], &mut buf).unwrap();
-    }
-    println!("Handshake done");
-    // Обмен сообщениями: сервер читает и пишет, клиент пишет и читает
-    if responder {
-        let mut buf = [0u8; 1024];
+/// Запускает сервер в отдельном потоке
+pub async fn run_server(
+    addr: &str,
+    static_key: Keypair,
+    on_message: impl Fn(String, std::net::SocketAddr) + Send + Sync + 'static,
+) -> Result<()> {
+    let addr = addr.to_string();
+    tokio::task::spawn_blocking(move || {
+        let listener = TcpListener::bind(&addr)
+            .with_context(|| format!("Failed to bind on {}", addr))?;
+        println!("Server listening on {}", addr);
+        for stream in listener.incoming() {
+            let stream = stream?;
+            let peer_addr = stream.peer_addr()?;
+            let static_key = static_key.clone();
+            let on_message = on_message.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = handle_connection(stream, static_key, true, on_message, peer_addr) {
+                    eprintln!("Error: {}", e);
+                }
+            });
+        }
+        Ok::<_, anyhow::Error>(())
+    }).await??;
+    Ok(())
+}
+
+/// Подключается к серверу и возвращает дескриптор для отправки сообщений
+pub async fn connect_client(
+    addr: &str,
+    static_key: Keypair,
+    on_message: impl Fn(String) + Send + Sync + 'static,
+) -> Result<ClientHandle> {
+    let addr = addr.to_string();
+    let (stream, noise) = tokio::task::spawn_blocking(move || {
+        let stream = TcpStream::connect(&addr)
+            .with_context(|| format!("Failed to connect to {}", addr))?;
+        let (stream, noise) = perform_handshake(stream, static_key, false)?;
+        Ok::<_, anyhow::Error>((stream, noise))
+    }).await??;
+    let stream = Arc::new(Mutex::new(stream));
+    let noise = Arc::new(Mutex::new(noise));
+    let on_message = Arc::new(on_message);
+
+    let stream_clone = stream.clone();
+    let noise_clone = noise.clone();
+    let on_message_clone = on_message.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut in_buf = [0u8; 65536];
         loop {
-            let n = stream.read(&mut buf).unwrap();
+            let n = {
+                let mut s = stream_clone.blocking_lock();
+                match s.read(&mut in_buf) {
+                    Ok(n) => n,
+                    Err(_) => break,
+                }
+            };
             if n == 0 { break; }
-            let mut plain = vec![0u8; n];
-            let m = noise.read_message(&buf[..n], &mut plain).unwrap();
-            let msg = String::from_utf8(plain[..m].to_vec()).unwrap();
-            println!("Received: {}", msg);
+            let mut out_buf = vec![0u8; n];
+            let m = {
+                let mut noise = noise_clone.blocking_lock();
+                noise.read_message(&in_buf[..n], &mut out_buf).unwrap()
+            };
+            let msg = String::from_utf8_lossy(&out_buf[..m]).to_string();
+            on_message_clone(msg);
         }
+    });
+
+    Ok(ClientHandle { stream, noise })
+}
+
+/// Обработка одного соединения (серверная сторона)
+fn handle_connection(
+    mut stream: TcpStream,
+    static_key: Keypair,
+    is_responder: bool,
+    on_message: impl Fn(String, std::net::SocketAddr),
+    peer_addr: std::net::SocketAddr,
+) -> Result<()> {
+    let (mut stream, mut noise) = perform_handshake(stream, static_key, is_responder)?;
+    let mut in_buf = [0u8; 65536];
+    loop {
+        let n = stream.read(&mut in_buf)?;
+        if n == 0 { break; }
+        let mut out_buf = vec![0u8; n];
+        let m = noise.read_message(&in_buf[..n], &mut out_buf)?;
+        let msg = String::from_utf8_lossy(&out_buf[..m]).to_string();
+        on_message(msg, peer_addr);
+    }
+    Ok(())
+}
+
+/// Выполняет Noise handshake (полностью синхронно, по паттерну XX)
+fn perform_handshake(
+    mut stream: TcpStream,
+    static_key: Keypair,
+    is_responder: bool,
+) -> Result<(TcpStream, TransportState)> {
+    let mut noise = if is_responder {
+        Builder::new(NOISE_PARAMS.parse()?)
+            .local_private_key(&static_key.private)
+            .build_responder()?
     } else {
-        let stdin = std::io::stdin();
-        loop {
-            let mut line = String::new();
-            stdin.read_line(&mut line).unwrap();
-            let line = line.trim();
-            if line.is_empty() { continue; }
-            let mut out = vec![0u8; 65535];
-            let len = noise.write_message(line.as_bytes(), &mut out).unwrap();
-            stream.write_all(&out[..len]).unwrap();
-        }
+        Builder::new(NOISE_PARAMS.parse()?)
+            .local_private_key(&static_key.private)
+            .build_initiator()?
+    };
+
+    let mut in_buf = [0u8; 65536];
+    let mut out_buf = [0u8; 65536];
+
+    if !is_responder {
+        // Инициатор: -> e
+        let len = noise.write_message(&[], &mut out_buf)?;
+        stream.write_all(&out_buf[..len])?;
+        // <- e, ee, s, es
+        let n = stream.read(&mut in_buf)?;
+        let len = noise.read_message(&in_buf[..n], &mut out_buf)?;
+        // -> s, se
+        let len = noise.write_message(&[], &mut out_buf)?;
+        stream.write_all(&out_buf[..len])?;
+        // <- (финал)
+        let n = stream.read(&mut in_buf)?;
+        noise.read_message(&in_buf[..n], &mut out_buf)?;
+    } else {
+        // Респондент: <- e
+        let n = stream.read(&mut in_buf)?;
+        noise.read_message(&in_buf[..n], &mut out_buf)?;
+        // -> e, ee, s, es
+        let len = noise.write_message(&[], &mut out_buf)?;
+        stream.write_all(&out_buf[..len])?;
+        // <- s, se
+        let n = stream.read(&mut in_buf)?;
+        noise.read_message(&in_buf[..n], &mut out_buf)?;
+    }
+    Ok((stream, noise))
+}
+
+/// Дескриптор клиента для отправки сообщений
+pub struct ClientHandle {
+    stream: Arc<Mutex<TcpStream>>,
+    noise: Arc<Mutex<TransportState>>,
+}
+
+impl ClientHandle {
+    pub async fn send(&self, msg: &str) -> Result<()> {
+        let mut out_buf = vec![0u8; msg.len() + 65535];
+        let n = {
+            let mut noise = self.noise.lock().await;
+            noise.write_message(msg.as_bytes(), &mut out_buf)?
+        };
+        let mut stream = self.stream.lock().await;
+        stream.write_all(&out_buf[..n])?;
+        Ok(())
     }
 }
