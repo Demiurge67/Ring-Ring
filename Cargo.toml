@@ -13,12 +13,8 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 # Async runtime
+snow = "0.9"
 tokio = { version = "1.35", features = ["full"] }
-
-# QUIC transport
-quinn = "0.11"
-rustls = "0.23"
-rcgen = "0.12"
 
 # Crypto & keys
 ed25519-dalek = "2.0"
