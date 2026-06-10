@@ -3,7 +3,7 @@ name = "ring_ring"
 version = "0.1.0"
 edition = "2021"
 authors = ["Demiurge67"]
-license = "GPL-3.0-only"
+license = "GPL-3.0"
 description = "P2P encrypted messenger core library"
 repository = "https://github.com/Demiurge67/Ring-Ring"
 
